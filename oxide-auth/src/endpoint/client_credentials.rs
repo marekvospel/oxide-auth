@@ -2,34 +2,35 @@ use std::borrow::Cow;
 use std::str::from_utf8;
 use std::marker::PhantomData;
 
-use crate::code_grant::accesstoken::{
-    access_token, Error as TokenError, Extension, Endpoint as TokenEndpoint, Request as TokenRequest,
+use crate::code_grant::client_credentials::{
+    client_credentials, Error as ClientCredentialsError, Extension,
+    Endpoint as ClientCredentialsEndpoint, Request as ClientCredentialsRequest,
 };
-use crate::primitives::{authorizer::Authorizer, registrar::Registrar, issuer::Issuer};
+use crate::code_grant::error::{AccessTokenError, AccessTokenErrorType};
+use crate::code_grant::refresh::ErrorDescription;
+use crate::primitives::{registrar::Registrar, issuer::Issuer};
 use super::{
     Endpoint, InnerTemplate, OAuthError, QueryParameter, WebRequest, WebResponse,
-    is_authorization_method,
+    is_authorization_method, OwnerConsent,
 };
 
 /// Offers access tokens to authenticated third parties.
 ///
-/// After having received an authorization code from the resource owner, a client must
-/// directly contact the OAuth endpoint–authenticating itself–to receive the access
-/// token. The token is then used as authorization in requests to the resource. This
-/// request MUST be protected by TLS.
+/// A client may request a token that provides access to their own resources.
 ///
 /// Client credentials can be allowed to appear in the request body instead of being
 /// required to be passed as HTTP Basic authorization. This is not recommended and must be
 /// enabled explicitely. See [`allow_credentials_in_body`] for details.
 ///
 /// [`allow_credentials_in_body`]: #method.allow_credentials_in_body
-pub struct AccessTokenFlow<E, R>
+pub struct ClientCredentialsFlow<E, R>
 where
     E: Endpoint<R>,
     R: WebRequest,
 {
     endpoint: WrappedToken<E, R>,
     allow_credentials_in_body: bool,
+    allow_refresh_token: bool,
 }
 
 struct WrappedToken<E: Endpoint<R>, R: WebRequest> {
@@ -42,7 +43,7 @@ struct WrappedRequest<'a, R: WebRequest + 'a> {
     /// Original request.
     request: PhantomData<R>,
 
-    /// The query in the url.
+    /// The request body
     body: Cow<'a, dyn QueryParameter + 'static>,
 
     /// The authorization tuple
@@ -64,7 +65,7 @@ enum FailParse<E> {
 
 struct Authorization(String, Vec<u8>);
 
-impl<E, R> AccessTokenFlow<E, R>
+impl<E, R> ClientCredentialsFlow<E, R>
 where
     E: Endpoint<R>,
     R: WebRequest,
@@ -84,21 +85,18 @@ where
             return Err(endpoint.error(OAuthError::PrimitiveError));
         }
 
-        if endpoint.authorizer_mut().is_none() {
-            return Err(endpoint.error(OAuthError::PrimitiveError));
-        }
-
         if endpoint.issuer_mut().is_none() {
             return Err(endpoint.error(OAuthError::PrimitiveError));
         }
 
-        Ok(AccessTokenFlow {
+        Ok(ClientCredentialsFlow {
             endpoint: WrappedToken {
                 inner: endpoint,
                 extension_fallback: (),
                 r_type: PhantomData,
             },
             allow_credentials_in_body: false,
+            allow_refresh_token: false,
         })
     }
 
@@ -113,6 +111,20 @@ where
         self.allow_credentials_in_body = allow;
     }
 
+    /// Allow the refresh token to be included in the response.
+    ///
+    /// According to [RFC-6749 Section 4.4.3][4.4.3] "A refresh token SHOULD NOT be included" in
+    /// the response for the client credentials grant. Following that recommendation, the default
+    /// behaviour of this flow is to discard any refresh token that is returned from the issuer.
+    ///
+    /// If this behaviour is not what you want (it is possible that your particular application
+    /// does have a use for a client credentials refresh token), you may enable this feature.
+    ///
+    /// [4.4.3]: https://www.rfc-editor.org/rfc/rfc6749#section-4.4.3
+    pub fn allow_refresh_token(&mut self, allow: bool) {
+        self.allow_refresh_token = allow;
+    }
+
     /// Use the checked endpoint to check for authorization for a resource.
     ///
     /// ## Panics
@@ -120,13 +132,58 @@ where
     /// When the registrar, authorizer, or issuer returned by the endpoint is suddenly
     /// `None` when previously it was `Some(_)`.
     pub fn execute(&mut self, mut request: R) -> Result<R::Response, E::Error> {
-        let issued = access_token(
+        let pending = client_credentials(
             &mut self.endpoint,
             &WrappedRequest::new(&mut request, self.allow_credentials_in_body),
         );
+        let pending = match pending {
+            Err(error) => {
+                return client_credentials_error(&mut self.endpoint.inner, &mut request, error)
+            }
+            Ok(pending) => pending,
+        };
 
-        let token = match issued {
-            Err(error) => return token_error(&mut self.endpoint.inner, &mut request, error),
+        let consent = self
+            .endpoint
+            .inner
+            .owner_solicitor()
+            .unwrap()
+            .check_consent(&mut request, pending.as_solicitation());
+
+        let owner_id = match consent {
+            OwnerConsent::Authorized(owner_id) => owner_id,
+            OwnerConsent::Error(error) => return Err(self.endpoint.inner.web_error(error)),
+            OwnerConsent::InProgress(..) => {
+                // User interaction is not permitted in the client credentials flow, so
+                // an InProgress response is invalid.
+                return Err(self.endpoint.inner.error(OAuthError::PrimitiveError));
+            }
+            OwnerConsent::Denied => {
+                let mut error = AccessTokenError::default();
+                error.set_type(AccessTokenErrorType::InvalidClient);
+                let mut json = ErrorDescription { error };
+                let mut response = self.endpoint.inner.response(
+                    &mut request,
+                    InnerTemplate::Unauthorized {
+                        error: None,
+                        access_token_error: Some(json.description()),
+                    }
+                    .into(),
+                )?;
+                response
+                    .client_error()
+                    .map_err(|err| self.endpoint.inner.web_error(err))?;
+                response
+                    .body_json(&json.to_json())
+                    .map_err(|err| self.endpoint.inner.web_error(err))?;
+                return Ok(response);
+            }
+        };
+
+        let token = match pending.issue(&mut self.endpoint, owner_id, self.allow_refresh_token) {
+            Err(error) => {
+                return client_credentials_error(&mut self.endpoint.inner, &mut request, error)
+            }
             Ok(token) => token,
         };
 
@@ -141,11 +198,12 @@ where
     }
 }
 
-fn token_error<E: Endpoint<R>, R: WebRequest>(
-    endpoint: &mut E, request: &mut R, error: TokenError,
+fn client_credentials_error<E: Endpoint<R>, R: WebRequest>(
+    endpoint: &mut E, request: &mut R, error: ClientCredentialsError,
 ) -> Result<R::Response, E::Error> {
     Ok(match error {
-        TokenError::Invalid(mut json) => {
+        ClientCredentialsError::Ignore => return Err(endpoint.error(OAuthError::DenySilently)),
+        ClientCredentialsError::Invalid(mut json) => {
             let mut response = endpoint.response(
                 request,
                 InnerTemplate::BadRequest {
@@ -159,7 +217,7 @@ fn token_error<E: Endpoint<R>, R: WebRequest>(
                 .map_err(|err| endpoint.web_error(err))?;
             response
         }
-        TokenError::Unauthorized(mut json, scheme) => {
+        ClientCredentialsError::Unauthorized(mut json, scheme) => {
             let mut response = endpoint.response(
                 request,
                 InnerTemplate::Unauthorized {
@@ -176,20 +234,16 @@ fn token_error<E: Endpoint<R>, R: WebRequest>(
                 .map_err(|err| endpoint.web_error(err))?;
             response
         }
-        TokenError::Primitive(_) => {
+        ClientCredentialsError::Primitive(_) => {
             // FIXME: give the context for restoration.
             return Err(endpoint.error(OAuthError::PrimitiveError));
         }
     })
 }
 
-impl<E: Endpoint<R>, R: WebRequest> TokenEndpoint for WrappedToken<E, R> {
+impl<E: Endpoint<R>, R: WebRequest> ClientCredentialsEndpoint for WrappedToken<E, R> {
     fn registrar(&self) -> &dyn Registrar {
         self.inner.registrar().unwrap()
-    }
-
-    fn authorizer(&mut self) -> &mut dyn Authorizer {
-        self.inner.authorizer_mut().unwrap()
     }
 
     fn issuer(&mut self) -> &mut dyn Issuer {
@@ -199,7 +253,7 @@ impl<E: Endpoint<R>, R: WebRequest> TokenEndpoint for WrappedToken<E, R> {
     fn extension(&mut self) -> &mut dyn Extension {
         self.inner
             .extension()
-            .and_then(super::Extension::access_token)
+            .and_then(super::Extension::client_credentials)
             .unwrap_or(&mut self.extension_fallback)
     }
 }
@@ -270,13 +324,9 @@ impl<'a, R: WebRequest + 'a> WrappedRequest<'a, R> {
     }
 }
 
-impl<'a, R: WebRequest> TokenRequest for WrappedRequest<'a, R> {
+impl<'a, R: WebRequest> ClientCredentialsRequest for WrappedRequest<'a, R> {
     fn valid(&self) -> bool {
         self.error.is_none()
-    }
-
-    fn code(&self) -> Option<Cow<str>> {
-        self.body.unique_value("code")
     }
 
     fn authorization(&self) -> Option<(Cow<str>, Cow<[u8]>)> {
@@ -285,16 +335,12 @@ impl<'a, R: WebRequest> TokenRequest for WrappedRequest<'a, R> {
             .map(|auth| (auth.0.as_str().into(), auth.1.as_slice().into()))
     }
 
-    fn client_id(&self) -> Option<Cow<str>> {
-        self.body.unique_value("client_id")
-    }
-
-    fn redirect_uri(&self) -> Option<Cow<str>> {
-        self.body.unique_value("redirect_uri")
-    }
-
     fn grant_type(&self) -> Option<Cow<str>> {
         self.body.unique_value("grant_type")
+    }
+
+    fn scope(&self) -> Option<Cow<str>> {
+        self.body.unique_value("scope")
     }
 
     fn extension(&self, key: &str) -> Option<Cow<str>> {

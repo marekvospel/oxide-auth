@@ -7,17 +7,16 @@ use std::collections::HashMap;
 pub use self::generic::{consent_page_html, open_in_browser, Client, ClientConfig, ClientError};
 
 use actix_web::{
-    App, dev, web, HttpServer, HttpResponse, Responder,
-    middleware::{
-        Logger,
-        normalize::{NormalizePath, TrailingSlash},
-    },
+    App, dev,
+    web::{self, Data},
+    HttpServer, HttpResponse, Responder,
+    middleware::{Logger, NormalizePath, TrailingSlash},
 };
 
 pub fn dummy_client() -> dev::Server {
     let client = Client::new(ClientConfig {
         client_id: "LocalClient".into(),
-        client_secret: None,
+        client_secret: Some("SecretSecret".to_owned()),
         protected_url: "http://localhost:8020/".into(),
         token_url: "http://localhost:8020/token".into(),
         refresh_url: "http://localhost:8020/refresh".into(),
@@ -26,7 +25,7 @@ pub fn dummy_client() -> dev::Server {
 
     HttpServer::new(move || {
         App::new()
-            .data(client.clone())
+            .app_data(Data::new(client.clone()))
             .wrap(Logger::default())
             .wrap(NormalizePath::new(TrailingSlash::Trim))
             .route("/endpoint", web::get().to(endpoint_impl))
@@ -51,21 +50,41 @@ async fn endpoint_impl(
         Some(code) => code.clone(),
     };
 
-    match state.authorize(&code) {
-        Ok(()) => HttpResponse::Found().header("Location", "/").finish(),
+    let auth_handle = tokio::task::spawn_blocking(move || {
+        let res = state.authorize(&code);
+        res
+    });
+    let auth_result = auth_handle.await.unwrap();
+
+    match auth_result {
+        Ok(()) => HttpResponse::Found().append_header(("Location", "/")).finish(),
         Err(err) => HttpResponse::InternalServerError().body(format!("{}", err)),
     }
 }
 
 async fn refresh(state: web::Data<Client>) -> impl Responder {
-    match state.refresh() {
-        Ok(()) => HttpResponse::Found().header("Location", "/").finish(),
+    let refresh_handle = tokio::task::spawn_blocking(move || {
+        let res = state.refresh();
+        res
+    });
+    let refresh_result = refresh_handle.await.unwrap();
+
+    match refresh_result {
+        Ok(()) => HttpResponse::Found().append_header(("Location", "/")).finish(),
         Err(err) => HttpResponse::InternalServerError().body(format!("{}", err)),
     }
 }
 
 async fn get_with_token(state: web::Data<Client>) -> impl Responder {
-    let protected_page = match state.retrieve_protected_page() {
+    let html = state.as_html();
+
+    let protected_page_handle = tokio::task::spawn_blocking(move || {
+        let res = state.retrieve_protected_page();
+        res
+    });
+    let protected_page_result = protected_page_handle.await.unwrap();
+
+    let protected_page = match protected_page_result {
         Ok(page) => page,
         Err(err) => return HttpResponse::InternalServerError().body(format!("{}", err)),
     };
@@ -82,7 +101,7 @@ async fn get_with_token(state: web::Data<Client>) -> impl Responder {
         Its contents are:
         <article>{}</article>
         <form action=\"refresh\" method=\"post\"><button>Refresh token</button></form>
-        </main></html>", state.as_html(), protected_page);
+        </main></html>", html, protected_page);
 
     HttpResponse::Ok().content_type("text/html").body(display_page)
 }

@@ -30,6 +30,7 @@
 //! [`Registrar`]: ../../primitives/registrar/trait.Registrar.html
 mod authorization;
 mod accesstoken;
+mod client_credentials;
 mod error;
 mod refresh;
 mod resource;
@@ -54,10 +55,12 @@ use url::Url;
 // Re-export the extension traits under prefixed names.
 pub use crate::code_grant::authorization::Extension as AuthorizationExtension;
 pub use crate::code_grant::accesstoken::Extension as AccessTokenExtension;
+pub use crate::code_grant::client_credentials::Extension as ClientCredentialsExtension;
 
 pub use crate::primitives::registrar::PreGrant;
 pub use self::authorization::*;
 pub use self::accesstoken::*;
+pub use self::client_credentials::ClientCredentialsFlow;
 pub use self::error::OAuthError;
 pub use self::refresh::RefreshFlow;
 pub use self::resource::*;
@@ -352,6 +355,11 @@ pub trait Extension {
 
     /// The handler for access token extensions.
     fn access_token(&mut self) -> Option<&mut dyn AccessTokenExtension> {
+        None
+    }
+
+    /// The handler for client credentials extensions.
+    fn client_credentials(&mut self) -> Option<&mut dyn ClientCredentialsExtension> {
         None
     }
 }
@@ -680,5 +688,14 @@ impl<'a, W: WebRequest, S: Scopes<W> + 'a + ?Sized> Scopes<W> for Box<S> {
 impl<'a> From<InnerTemplate<'a>> for Template<'a> {
     fn from(inner: InnerTemplate<'a>) -> Self {
         Template { inner }
+    }
+}
+
+fn is_authorization_method<'h>(header: &'h str, method: &'static str) -> Option<&'h str> {
+    let header_method = header.get(..method.len())?;
+    if header_method.eq_ignore_ascii_case(method) {
+        Some(&header[method.len()..])
+    } else {
+        None
     }
 }
